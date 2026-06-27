@@ -770,13 +770,16 @@ def main() -> None:
         "index", "review", "ask", "plan", "patch",
         "apply", "diff", "run", "config", "chat",
     }
-    # If the first non-flag argument isn't a known command, treat it as `ask`
-    for i, arg in enumerate(sys.argv[1:], 1):
-        if arg.startswith("-"):
-            continue
-        if arg not in _COMMANDS:
-            sys.argv.insert(1, "ask")
-        break
+    non_flags = [a for a in sys.argv[1:] if not a.startswith("-")]
+    help_requested = bool({"--help", "-h"} & set(sys.argv[1:]))
+
+    if not non_flags and not help_requested:
+        # Bare `ai` → drop into conversational chat
+        sys.argv.insert(1, "chat")
+    elif non_flags and non_flags[0] not in _COMMANDS:
+        # Words but no known command → treat as a one-shot question
+        idx = next(i for i, a in enumerate(sys.argv[1:], 1) if not a.startswith("-"))
+        sys.argv.insert(idx, "ask")
     app()
 
 
