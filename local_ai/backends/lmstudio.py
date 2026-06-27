@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Iterator, Optional
 
 import httpx
@@ -159,6 +160,7 @@ class LMStudioBackend(BaseBackend):
         content = (message.get("content") or "").strip()
         tool_calls: list[ToolCall] = []
 
+        # Standard OpenAI tool_calls array
         for tc in message.get("tool_calls") or []:
             func = tc.get("function") or {}
             try:
@@ -172,6 +174,10 @@ class LMStudioBackend(BaseBackend):
                     input=args,
                 )
             )
+
+        # Fallback: parse DeepSeek's embedded tool-call marker format
+        if not tool_calls and content:
+            content, tool_calls = _parse_deepseek_tool_calls(content)
 
         usage = data.get("usage") or {}
         return AgentResponse(
@@ -223,6 +229,46 @@ class LMStudioBackend(BaseBackend):
 
 
 # ------------------------------------------------------------------ helpers
+
+# DeepSeek uses special Unicode markers for tool calls embedded in text content
+# rather than the standard OpenAI tool_calls array.
+_DS_TOOL_CALL_RE = re.compile(
+    r"<｜tool▁call▁begin｜>function<｜tool▁sep｜>(\w+)\s*```(?:json)?\s*(\{.*?\})\s*```<｜tool▁call▁end｜>",
+    re.DOTALL,
+)
+_DS_TOOL_CALLS_BEGIN = "<｜tool▁calls▁begin｜>"
+_DS_TOOL_OUTPUTS_BEGIN = "<｜tool▁outputs▁begin｜>"
+
+
+def _parse_deepseek_tool_calls(content: str) -> tuple[str, list[ToolCall]]:
+    """
+    Parse DeepSeek's embedded tool-call markers from text content.
+
+    Returns (cleaned_content, tool_calls) where cleaned_content has the tool
+    call block and any hallucinated output section stripped.
+    """
+    if _DS_TOOL_CALLS_BEGIN not in content:
+        return content, []
+
+    # Strip the tool-calls block and everything after (model often hallucinates
+    # its own tool outputs section which we don't want).
+    pre = content[: content.index(_DS_TOOL_CALLS_BEGIN)]
+    tool_block = content[content.index(_DS_TOOL_CALLS_BEGIN):]
+    # Also strip any hallucinated <｜tool▁outputs▁begin｜> section
+    if _DS_TOOL_OUTPUTS_BEGIN in tool_block:
+        tool_block = tool_block[: tool_block.index(_DS_TOOL_OUTPUTS_BEGIN)]
+
+    tool_calls: list[ToolCall] = []
+    for i, match in enumerate(_DS_TOOL_CALL_RE.finditer(tool_block)):
+        func_name = match.group(1)
+        try:
+            args = json.loads(match.group(2))
+        except json.JSONDecodeError:
+            args = {}
+        tool_calls.append(ToolCall(id=f"call_{i}", name=func_name, input=args))
+
+    return pre.strip(), tool_calls
+
 
 def _to_openai_tools(tools: list[dict]) -> list[dict]:
     return [

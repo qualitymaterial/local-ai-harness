@@ -105,8 +105,15 @@ def _get_index(root: Path) -> RepoIndex:
     return _do_index(root, quiet=True)
 
 
-def _call_model(config: Config, system: str, context_body: str, request: str) -> str:
-    """Call the model, streaming if config.stream is True."""
+def _call_model(
+    config: Config,
+    system: str,
+    context_body: str,
+    request: str,
+    *,
+    repo_root: Optional[Path] = None,
+) -> str:
+    """Call the model, using streaming / agentic mode based on config."""
     messages = prompts.build_messages(system, context_body, request)
     msgs = [{"role": m.role, "content": m.content} for m in messages]
 
@@ -116,26 +123,33 @@ def _call_model(config: Config, system: str, context_body: str, request: str) ->
         err_console.print(Panel.fit(str(exc), title="[red]Backend error[/red]", border_style="red"))
         raise typer.Exit(code=1)
 
-    if config.stream:
-        chunks: list[str] = []
+    model_label = config.claude_model if config.backend == "claude" else config.model
+
+    # ── Agentic mode: tool-use loop, then stream the final answer ──────────
+    if config.agentic and repo_root is not None:
+        from .agent import run_agent
+
+        # In agentic mode the model fetches its own context via tools.
+        # Collapse to two clean messages: agentic system prompt + single user request.
+        # (Two consecutive user messages confuse local models and the context blob
+        # conflicts with the "use tools to get context" instruction.)
+        msgs = [
+            {"role": "system", "content": prompts.AGENTIC_OVERRIDE},
+            {"role": "user", "content": request},
+        ]
+
+        def _on_tool(name: str, inp: dict) -> None:
+            args_preview = ", ".join(f"{k}={v!r}" for k, v in list(inp.items())[:2])
+            console.print(f"  [dim][tool: {name}({args_preview})][/dim]")
+
         try:
-            for chunk in backend.stream(msgs):
-                console.print(chunk, end="", highlight=False)
-                sys.stdout.flush()
-                chunks.append(chunk)
-            console.print()
-        except (ModelError, ConfigError) as exc:
-            console.print()
-            err_console.print(Panel.fit(str(exc), title="[red]Model error[/red]", border_style="red"))
-            if hasattr(exc, "hint") and exc.hint:
-                err_console.print(f"[yellow]Hint:[/yellow] {exc.hint}")
-            raise typer.Exit(code=1)
-        return "".join(chunks)
-    else:
-        model_label = config.claude_model if config.backend == "claude" else config.model
-        try:
-            with console.status(f"[cyan]Asking {model_label}...[/cyan]"):
-                resp = backend.complete(msgs)
+            with console.status(f"[cyan]Asking {model_label} (agentic)...[/cyan]"):
+                resp = run_agent(
+                    backend, msgs,
+                    repo_root=repo_root,
+                    max_iterations=config.max_agent_iterations,
+                    on_tool_call=_on_tool,
+                )
         except (ModelError, ConfigError) as exc:
             err_console.print(Panel.fit(str(exc), title="[red]Model error[/red]", border_style="red"))
             if hasattr(exc, "hint") and exc.hint:
@@ -144,10 +158,44 @@ def _call_model(config: Config, system: str, context_body: str, request: str) ->
         if resp.prompt_tokens:
             console.print(
                 f"[dim]tokens: prompt={resp.prompt_tokens} "
-                f"completion={resp.completion_tokens} "
-                f"finish={resp.finish_reason}[/dim]"
+                f"completion={resp.completion_tokens}[/dim]"
             )
         return resp.content
+
+    # ── Streaming mode ───────────────────────────────────────────────────────
+    if config.stream:
+        chunks: list[str] = []
+        try:
+            for chunk in backend.stream(msgs):
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+                chunks.append(chunk)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        except (ModelError, ConfigError) as exc:
+            sys.stdout.write("\n")
+            err_console.print(Panel.fit(str(exc), title="[red]Model error[/red]", border_style="red"))
+            if hasattr(exc, "hint") and exc.hint:
+                err_console.print(f"[yellow]Hint:[/yellow] {exc.hint}")
+            raise typer.Exit(code=1)
+        return "".join(chunks)
+
+    # ── Non-streaming mode ───────────────────────────────────────────────────
+    try:
+        with console.status(f"[cyan]Asking {model_label}...[/cyan]"):
+            resp = backend.complete(msgs)
+    except (ModelError, ConfigError) as exc:
+        err_console.print(Panel.fit(str(exc), title="[red]Model error[/red]", border_style="red"))
+        if hasattr(exc, "hint") and exc.hint:
+            err_console.print(f"[yellow]Hint:[/yellow] {exc.hint}")
+        raise typer.Exit(code=1)
+    if resp.prompt_tokens:
+        console.print(
+            f"[dim]tokens: prompt={resp.prompt_tokens} "
+            f"completion={resp.completion_tokens} "
+            f"finish={resp.finish_reason}[/dim]"
+        )
+    return resp.content
 
 
 def _print_context_summary(packet: ctx.ContextPacket) -> None:
@@ -214,6 +262,7 @@ def review(path: str = typer.Argument(..., help="Path to the repository to revie
     output = _call_model(
         config, prompts.REPO_REVIEW_SYSTEM, packet.body,
         "Review this repository thoroughly following the required section structure.",
+        repo_root=root,
     )
 
     ts = report_writer.timestamp()
@@ -250,7 +299,7 @@ def ask(
     packet = ctx.build_context(index_result, question, max_context_tokens=config.max_context_tokens)
     _print_context_summary(packet)
 
-    output = _call_model(config, prompts.ASK_SYSTEM, packet.body, question)
+    output = _call_model(config, prompts.ASK_SYSTEM, packet.body, question, repo_root=root)
 
     mem = Memory.load(root)
     mem.record("ask", question=question[:200])
@@ -274,7 +323,7 @@ def plan(
     packet = ctx.build_context(index_result, task, max_context_tokens=config.max_context_tokens)
     _print_context_summary(packet)
 
-    output = _call_model(config, prompts.PLAN_SYSTEM, packet.body, f"Task: {task}")
+    output = _call_model(config, prompts.PLAN_SYSTEM, packet.body, f"Task: {task}", repo_root=root)
 
     ts = report_writer.timestamp()
     full = (
@@ -307,7 +356,7 @@ def patch(
     packet = ctx.build_context(index_result, task, max_context_tokens=config.max_context_tokens)
     _print_context_summary(packet)
 
-    output = _call_model(config, prompts.PATCH_SYSTEM, packet.body, f"Task: {task}")
+    output = _call_model(config, prompts.PATCH_SYSTEM, packet.body, f"Task: {task}", repo_root=root)
 
     diff_text = patcher.extract_diff(output)
     ts = report_writer.timestamp()
@@ -432,7 +481,7 @@ def diff(path: str = typer.Argument(..., help="Path to the git repository.")) ->
         diff_text = diff_text[:max_chars] + "\n...[diff truncated for context budget]...\n"
 
     context_body = "## Current git diff (HEAD)\n\n```diff\n" + diff_text + "\n```\n"
-    output = _call_model(config, prompts.DIFF_REVIEW_SYSTEM, context_body, "Review this diff.")
+    output = _call_model(config, prompts.DIFF_REVIEW_SYSTEM, context_body, "Review this diff.", repo_root=root)
 
     mem = Memory.load(root)
     mem.record("diff_review")
@@ -495,6 +544,7 @@ def run(
         diagnosis = _call_model(
             config, prompts.RUN_DIAGNOSIS_SYSTEM, diag_context,
             "Diagnose why this command failed and how to fix it.",
+            repo_root=root,
         )
         report += "\n\n## Diagnosis\n\n" + diagnosis
         if not config.stream:
@@ -653,10 +703,11 @@ def chat(
                 # Streaming chat (no tool use)
                 chunks: list[str] = []
                 for chunk in backend.stream(session.messages):
-                    console.print(chunk, end="", highlight=False)
+                    sys.stdout.write(chunk)
                     sys.stdout.flush()
                     chunks.append(chunk)
-                console.print()
+                sys.stdout.write("\n")
+                sys.stdout.flush()
                 response_text = "".join(chunks)
                 session.messages.append({"role": "assistant", "content": response_text})
 
