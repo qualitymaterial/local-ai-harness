@@ -28,7 +28,7 @@ dev = [
 ]
 
 [project.scripts]
-local-ai = "local_ai.cli:app"
+local-ai = "local_ai.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

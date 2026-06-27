@@ -28,7 +28,7 @@ DEFAULTS: dict[str, object] = {
     "model": "deepseek-coder-v2-lite-instruct",
     "base_url": "http://localhost:1234/v1",
     "api_key": "lm-studio",
-    "max_context_tokens": 12000,
+    "max_context_tokens": 3000,
     "temperature": 0.2,
     "top_p": 0.9,
     "request_timeout": 600,

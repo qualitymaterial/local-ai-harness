@@ -759,5 +759,22 @@ def _build_run_report(result: CommandResult) -> str:
     return "\n".join(parts)
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point — bare `ai "question"` defaults to the ask command."""
+    import sys
+    _COMMANDS = {
+        "index", "review", "ask", "plan", "patch",
+        "apply", "diff", "run", "config", "chat",
+    }
+    # If the first non-flag argument isn't a known command, treat it as `ask`
+    for i, arg in enumerate(sys.argv[1:], 1):
+        if arg.startswith("-"):
+            continue
+        if arg not in _COMMANDS:
+            sys.argv.insert(1, "ask")
+        break
     app()
+
+
+if __name__ == "__main__":
+    main()
