@@ -1,0 +1,21 @@
+# local-ai workspace artifacts
+.local-ai/reports/
+.local-ai/plans/
+.local-ai/patches/
+.local-ai/runs/
+.local-ai/repo_map.md
+.local-ai/repo_index.json
+.local-ai/memory.json
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# OS
+.DS_Store
