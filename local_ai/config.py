@@ -24,13 +24,22 @@ CONFIG_FILENAME = "config.toml"
 
 
 DEFAULTS: dict[str, object] = {
+    # LM Studio backend
     "model": "deepseek-coder-v2-lite-instruct",
     "base_url": "http://localhost:1234/v1",
     "api_key": "lm-studio",
     "max_context_tokens": 12000,
     "temperature": 0.2,
     "top_p": 0.9,
-    "request_timeout": 600,  # seconds; local models can be slow
+    "request_timeout": 600,
+    # Backend selection
+    "backend": "lmstudio",        # "lmstudio" | "claude"
+    "claude_model": "claude-opus-4-8",
+    "claude_api_key": "",         # prefer ANTHROPIC_API_KEY env var or ~/.claude/.env
+    # Feature flags
+    "stream": False,              # token-by-token streaming output
+    "agentic": False,             # enable multi-step tool-use loop
+    "max_agent_iterations": 5,
 }
 
 
@@ -43,6 +52,12 @@ class Config:
     temperature: float
     top_p: float
     request_timeout: int
+    backend: str
+    claude_model: str
+    claude_api_key: str
+    stream: bool
+    agentic: bool
+    max_agent_iterations: int
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "Config":
@@ -51,14 +66,24 @@ class Config:
             model=str(merged["model"]),
             base_url=str(merged["base_url"]).rstrip("/"),
             api_key=str(merged["api_key"]),
-            max_context_tokens=int(merged["max_context_tokens"]),
-            temperature=float(merged["temperature"]),
-            top_p=float(merged["top_p"]),
-            request_timeout=int(merged["request_timeout"]),
+            max_context_tokens=int(merged["max_context_tokens"]),  # type: ignore[arg-type]
+            temperature=float(merged["temperature"]),  # type: ignore[arg-type]
+            top_p=float(merged["top_p"]),  # type: ignore[arg-type]
+            request_timeout=int(merged["request_timeout"]),  # type: ignore[arg-type]
+            backend=str(merged["backend"]),
+            claude_model=str(merged["claude_model"]),
+            claude_api_key=str(merged["claude_api_key"]),
+            stream=bool(merged["stream"]),
+            agentic=bool(merged["agentic"]),
+            max_agent_iterations=int(merged["max_agent_iterations"]),  # type: ignore[arg-type]
         )
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+    @property
+    def active_model(self) -> str:
+        return self.claude_model if self.backend == "claude" else self.model
 
 
 def workspace_dir(repo_root: Path) -> Path:
@@ -93,6 +118,12 @@ def _env_overrides() -> dict[str, object]:
             out["max_context_tokens"] = int(v)
         except ValueError:
             raise ConfigError("LOCAL_AI_MAX_CONTEXT_TOKENS must be an integer")
+    if v := os.environ.get("LOCAL_AI_BACKEND"):
+        out["backend"] = v
+    if v := os.environ.get("LOCAL_AI_STREAM"):
+        out["stream"] = v.lower() in ("1", "true", "yes")
+    if v := os.environ.get("LOCAL_AI_AGENTIC"):
+        out["agentic"] = v.lower() in ("1", "true", "yes")
     return out
 
 

@@ -1,12 +1,13 @@
 """local-ai command-line interface.
 
-Commands: index, review, ask, plan, patch, apply, diff, run, config.
+Commands: index, review, ask, plan, patch, apply, diff, run, config, chat.
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -18,16 +19,20 @@ from rich.table import Table
 from . import context_builder as ctx
 from . import patcher, prompts, report_writer
 from . import scanner as scan
+from .backends import get_backend
 from .command_runner import CommandResult, check_dangerous, run_command, tail
-from .config import Config, ConfigError, ensure_default_config, load_config
+from .config import Config, ConfigError, ensure_default_config, load_config, workspace_dir
 from .memory import Memory
 from .model_client import ModelClient, ModelError
+from .session import Session
 from .types import RepoIndex
 
 app = typer.Typer(
     name="local-ai",
-    help="Local-first coding assistant for LM Studio. Scans a repo, builds context, "
-    "and asks your local model for reviews, answers, plans, and patches.",
+    help=(
+        "Local-first coding assistant for LM Studio and Claude. "
+        "Scans a repo, builds context, and asks your model for reviews, answers, plans, and patches."
+    ),
     no_args_is_help=True,
     add_completion=False,
 )
@@ -101,23 +106,48 @@ def _get_index(root: Path) -> RepoIndex:
 
 
 def _call_model(config: Config, system: str, context_body: str, request: str) -> str:
-    client = ModelClient(config)
+    """Call the model, streaming if config.stream is True."""
     messages = prompts.build_messages(system, context_body, request)
+    msgs = [{"role": m.role, "content": m.content} for m in messages]
+
     try:
-        with console.status(f"[cyan]Asking {config.model}...[/cyan]"):
-            response = client.chat(messages)
-    except ModelError as exc:
-        err_console.print(Panel.fit(str(exc), title="[red]Model error[/red]", border_style="red"))
-        if exc.hint:
-            err_console.print(f"[yellow]Hint:[/yellow] {exc.hint}")
+        backend = get_backend(config)
+    except (ConfigError, ImportError) as exc:
+        err_console.print(Panel.fit(str(exc), title="[red]Backend error[/red]", border_style="red"))
         raise typer.Exit(code=1)
-    if response.prompt_tokens:
-        console.print(
-            f"[dim]tokens: prompt={response.prompt_tokens} "
-            f"completion={response.completion_tokens} "
-            f"finish={response.finish_reason}[/dim]"
-        )
-    return response.content
+
+    if config.stream:
+        chunks: list[str] = []
+        try:
+            for chunk in backend.stream(msgs):
+                console.print(chunk, end="", highlight=False)
+                sys.stdout.flush()
+                chunks.append(chunk)
+            console.print()
+        except (ModelError, ConfigError) as exc:
+            console.print()
+            err_console.print(Panel.fit(str(exc), title="[red]Model error[/red]", border_style="red"))
+            if hasattr(exc, "hint") and exc.hint:
+                err_console.print(f"[yellow]Hint:[/yellow] {exc.hint}")
+            raise typer.Exit(code=1)
+        return "".join(chunks)
+    else:
+        model_label = config.claude_model if config.backend == "claude" else config.model
+        try:
+            with console.status(f"[cyan]Asking {model_label}...[/cyan]"):
+                resp = backend.complete(msgs)
+        except (ModelError, ConfigError) as exc:
+            err_console.print(Panel.fit(str(exc), title="[red]Model error[/red]", border_style="red"))
+            if hasattr(exc, "hint") and exc.hint:
+                err_console.print(f"[yellow]Hint:[/yellow] {exc.hint}")
+            raise typer.Exit(code=1)
+        if resp.prompt_tokens:
+            console.print(
+                f"[dim]tokens: prompt={resp.prompt_tokens} "
+                f"completion={resp.completion_tokens} "
+                f"finish={resp.finish_reason}[/dim]"
+            )
+        return resp.content
 
 
 def _print_context_summary(packet: ctx.ContextPacket) -> None:
@@ -128,9 +158,12 @@ def _print_context_summary(packet: ctx.ContextPacket) -> None:
         table.add_row("[dim]files dropped (budget)[/dim]", str(len(packet.skipped_files)))
     console.print(table)
     if packet.included_files:
-        console.print("[dim]" + ", ".join(packet.included_files[:12]) + (
-            " ..." if len(packet.included_files) > 12 else ""
-        ) + "[/dim]")
+        console.print(
+            "[dim]"
+            + ", ".join(packet.included_files[:12])
+            + (" ..." if len(packet.included_files) > 12 else "")
+            + "[/dim]"
+        )
 
 
 # --------------------------------------------------------------------------- commands
@@ -141,19 +174,24 @@ def index(path: str = typer.Argument(..., help="Path to the repository to scan."
     """Scan a repo and write .local-ai/repo_map.md + repo_index.json."""
     root = _resolve_root(path)
     ensure_default_config(root)
-    index = _do_index(root)
+    index_result = _do_index(root)
 
     table = Table(title=f"Indexed {root.name}", show_header=True, header_style="bold cyan")
     table.add_column("Metric")
     table.add_column("Value")
-    table.add_row("Files scanned", str(index.file_count))
-    table.add_row("Total size", f"{index.total_size_bytes / 1024:.1f} KB")
-    table.add_row("Detected stack", ", ".join(index.frameworks) or "—")
-    table.add_row("Languages", ", ".join(f"{k}({v})" for k, v in index.languages.items()) or "—")
-    table.add_row("Important files", str(len(index.important_files)))
+    table.add_row("Files scanned", str(index_result.file_count))
+    table.add_row("Total size", f"{index_result.total_size_bytes / 1024:.1f} KB")
+    table.add_row("Detected stack", ", ".join(index_result.frameworks) or "—")
+    table.add_row(
+        "Languages",
+        ", ".join(f"{k}({v})" for k, v in index_result.languages.items()) or "—",
+    )
+    table.add_row("Important files", str(len(index_result.important_files)))
     console.print(table)
-    console.print(f"[green]✓[/green] Wrote [bold].local-ai/repo_map.md[/bold] and "
-                  f"[bold].local-ai/repo_index.json[/bold]")
+    console.print(
+        "[green]✓[/green] Wrote [bold].local-ai/repo_map.md[/bold] and "
+        "[bold].local-ai/repo_index.json[/bold]"
+    )
 
 
 @app.command()
@@ -162,18 +200,21 @@ def review(path: str = typer.Argument(..., help="Path to the repository to revie
     root = _resolve_root(path)
     ensure_default_config(root)
     config = _load_config_or_exit(root)
-    index = _get_index(root)
+    index_result = _get_index(root)
 
-    repo_map = ctx.build_repo_map(index)
+    repo_map = ctx.build_repo_map(index_result)
     query = "overall architecture entry points bugs security performance dependencies tests"
-    packet = ctx.build_context(index, query, max_context_tokens=config.max_context_tokens,
-                               repo_map=repo_map)
+    packet = ctx.build_context(
+        index_result, query,
+        max_context_tokens=config.max_context_tokens,
+        repo_map=repo_map,
+    )
     _print_context_summary(packet)
 
-    request = (
-        "Review this repository thoroughly following the required section structure."
+    output = _call_model(
+        config, prompts.REPO_REVIEW_SYSTEM, packet.body,
+        "Review this repository thoroughly following the required section structure.",
     )
-    output = _call_model(config, prompts.REPO_REVIEW_SYSTEM, packet.body, request)
 
     ts = report_writer.timestamp()
     full = output + report_writer.context_footer(
@@ -185,8 +226,13 @@ def review(path: str = typer.Argument(..., help="Path to the repository to revie
     mem.record("review", report=str(report_path.relative_to(root)))
     mem.save()
 
-    console.print(Panel(output[:1600] + ("\n\n[dim]... (truncated; see full report)[/dim]"
-                  if len(output) > 1600 else ""), title="Review summary", border_style="cyan"))
+    console.print(
+        Panel(
+            output[:1600] + ("\n\n[dim]... (truncated; see full report)[/dim]" if len(output) > 1600 else ""),
+            title="Review summary",
+            border_style="cyan",
+        )
+    )
     console.print(f"[green]✓[/green] Full report: [bold]{report_path}[/bold]")
 
 
@@ -199,9 +245,9 @@ def ask(
     root = _resolve_root(path)
     ensure_default_config(root)
     config = _load_config_or_exit(root)
-    index = _get_index(root)
+    index_result = _get_index(root)
 
-    packet = ctx.build_context(index, question, max_context_tokens=config.max_context_tokens)
+    packet = ctx.build_context(index_result, question, max_context_tokens=config.max_context_tokens)
     _print_context_summary(packet)
 
     output = _call_model(config, prompts.ASK_SYSTEM, packet.body, question)
@@ -210,7 +256,8 @@ def ask(
     mem.record("ask", question=question[:200])
     mem.save()
 
-    console.print(Panel(output, title="Answer", border_style="cyan"))
+    if not config.stream:
+        console.print(Panel(output, title="Answer", border_style="cyan"))
 
 
 @app.command()
@@ -222,16 +269,18 @@ def plan(
     root = _resolve_root(path)
     ensure_default_config(root)
     config = _load_config_or_exit(root)
-    index = _get_index(root)
+    index_result = _get_index(root)
 
-    packet = ctx.build_context(index, task, max_context_tokens=config.max_context_tokens)
+    packet = ctx.build_context(index_result, task, max_context_tokens=config.max_context_tokens)
     _print_context_summary(packet)
 
     output = _call_model(config, prompts.PLAN_SYSTEM, packet.body, f"Task: {task}")
 
     ts = report_writer.timestamp()
-    full = f"# Plan\n\n**Task:** {task}\n\n" + output + report_writer.context_footer(
-        packet.included_files, packet.skipped_files, packet.approx_tokens
+    full = (
+        f"# Plan\n\n**Task:** {task}\n\n"
+        + output
+        + report_writer.context_footer(packet.included_files, packet.skipped_files, packet.approx_tokens)
     )
     plan_path = report_writer.write_plan(root, full, ts)
 
@@ -239,7 +288,8 @@ def plan(
     mem.record("plan", task=task[:200], plan=str(plan_path.relative_to(root)))
     mem.save()
 
-    console.print(Panel(output, title="Implementation plan", border_style="cyan"))
+    if not config.stream:
+        console.print(Panel(output, title="Implementation plan", border_style="cyan"))
     console.print(f"[green]✓[/green] Plan written: [bold]{plan_path}[/bold]")
 
 
@@ -252,9 +302,9 @@ def patch(
     root = _resolve_root(path)
     ensure_default_config(root)
     config = _load_config_or_exit(root)
-    index = _get_index(root)
+    index_result = _get_index(root)
 
-    packet = ctx.build_context(index, task, max_context_tokens=config.max_context_tokens)
+    packet = ctx.build_context(index_result, task, max_context_tokens=config.max_context_tokens)
     _print_context_summary(packet)
 
     output = _call_model(config, prompts.PATCH_SYSTEM, packet.body, f"Task: {task}")
@@ -272,16 +322,19 @@ def patch(
     mem.record("patch", task=task[:200], produced_diff=bool(diff_text))
     mem.save()
 
-    console.print(Panel(output[:1600] + ("\n\n[dim]...[/dim]" if len(output) > 1600 else ""),
-                  title="Patch explanation", border_style="cyan"))
+    if not config.stream:
+        console.print(
+            Panel(
+                output[:1600] + ("\n\n[dim]...[/dim]" if len(output) > 1600 else ""),
+                title="Patch explanation",
+                border_style="cyan",
+            )
+        )
 
     if diff_text:
         stats = patcher.diff_stats(diff_text)
         console.print(f"[green]✓[/green] Proposed diff: [bold]{diff_path}[/bold]")
-        console.print(
-            f"[dim]{len(stats.files)} file(s), +{stats.additions}/-{stats.deletions}[/dim]"
-        )
-        # Best-effort cleanliness check.
+        console.print(f"[dim]{len(stats.files)} file(s), +{stats.additions}/-{stats.deletions}[/dim]")
         check = patcher.check_apply(root, diff_path)  # type: ignore[arg-type]
         if check.ok:
             console.print("[green]✓[/green] Patch applies cleanly (git apply --check).")
@@ -314,9 +367,11 @@ def apply(
     for f in stats.files:
         table.add_row(f)
     console.print(table)
-    console.print(f"[bold]+{stats.additions}[/bold] additions, "
-                  f"[bold]-{stats.deletions}[/bold] deletions across "
-                  f"{len(stats.files)} file(s).")
+    console.print(
+        f"[bold]+{stats.additions}[/bold] additions, "
+        f"[bold]-{stats.deletions}[/bold] deletions across "
+        f"{len(stats.files)} file(s)."
+    )
 
     check = patcher.check_apply(root, diff_path)
     if not check.ok:
@@ -372,19 +427,19 @@ def diff(path: str = typer.Argument(..., help="Path to the git repository.")) ->
         console.print("[yellow]No changes detected (git diff HEAD is empty).[/yellow]")
         raise typer.Exit(code=0)
 
-    # Keep the diff within budget (diffs can be large).
     max_chars = config.max_context_tokens * ctx.CHARS_PER_TOKEN
     if len(diff_text) > max_chars:
         diff_text = diff_text[:max_chars] + "\n...[diff truncated for context budget]...\n"
 
     context_body = "## Current git diff (HEAD)\n\n```diff\n" + diff_text + "\n```\n"
-    output = _call_model(config, prompts.DIFF_REVIEW_SYSTEM, context_body,
-                         "Review this diff.")
+    output = _call_model(config, prompts.DIFF_REVIEW_SYSTEM, context_body, "Review this diff.")
 
     mem = Memory.load(root)
     mem.record("diff_review")
     mem.save()
-    console.print(Panel(output, title="Diff review", border_style="cyan"))
+
+    if not config.stream:
+        console.print(Panel(output, title="Diff review", border_style="cyan"))
 
 
 @app.command()
@@ -400,11 +455,14 @@ def run(
 
     dangers = check_dangerous(command)
     if dangers and not yes:
-        err_console.print(Panel(
-            f"This command looks potentially destructive:\n  [bold]{command}[/bold]\n\n"
-            f"Matched: {', '.join(dangers)}",
-            title="[red]⚠ Dangerous command[/red]", border_style="red",
-        ))
+        err_console.print(
+            Panel(
+                f"This command looks potentially destructive:\n  [bold]{command}[/bold]\n\n"
+                f"Matched: {', '.join(dangers)}",
+                title="[red]⚠ Dangerous command[/red]",
+                border_style="red",
+            )
+        )
         if not typer.confirm("Run it anyway?", default=False):
             console.print("Aborted.")
             raise typer.Exit(code=0)
@@ -425,9 +483,8 @@ def run(
 
     if not result.ok:
         console.print("[yellow]Command failed — asking the model to diagnose...[/yellow]")
-        index = _get_index(root)
-        # Light context: repo map + the failing command output.
-        repo_map = ctx.build_repo_map(index)
+        index_result = _get_index(root)
+        repo_map = ctx.build_repo_map(index_result)
         diag_context = (
             repo_map
             + "\n\n## Failed command\n\n```\n" + command + "\n```\n"
@@ -440,7 +497,8 @@ def run(
             "Diagnose why this command failed and how to fix it.",
         )
         report += "\n\n## Diagnosis\n\n" + diagnosis
-        console.print(Panel(diagnosis, title="Diagnosis", border_style="yellow"))
+        if not config.stream:
+            console.print(Panel(diagnosis, title="Diagnosis", border_style="yellow"))
 
     run_path = report_writer.write_run(root, report, ts)
     mem = Memory.load(root)
@@ -457,22 +515,173 @@ def config(path: str = typer.Argument(".", help="Path to the repository.")) -> N
     root = _resolve_root(path)
     cfg_path = ensure_default_config(root)
     cfg = _load_config_or_exit(root)
+
     table = Table(title="Effective config", header_style="bold cyan")
     table.add_column("Key")
     table.add_column("Value")
     for k, v in cfg.to_dict().items():
-        masked = "***" if k == "api_key" else str(v)
+        if k in ("api_key", "claude_api_key"):
+            masked = "***" if v else "(not set)"
+        else:
+            masked = str(v)
         table.add_row(k, masked)
     console.print(table)
     console.print(f"[dim]Config file: {cfg_path}[/dim]")
-    # Quick reachability probe.
-    client = ModelClient(cfg)
-    reachable = client.health_check()
-    if reachable:
-        console.print(f"[green]✓[/green] LM Studio reachable at {cfg.base_url}")
+
+    # Reachability probe depends on active backend
+    if cfg.backend == "claude":
+        from .backends.claude import _resolve_api_key
+        try:
+            _resolve_api_key(cfg)
+            console.print("[green]✓[/green] Anthropic API key found.")
+        except ConfigError as exc:
+            console.print(f"[yellow]⚠ {exc}[/yellow]")
     else:
-        console.print(f"[yellow]⚠ Could not reach {cfg.base_url}/models — "
-                      f"is the LM Studio server started?[/yellow]")
+        client = ModelClient(cfg)
+        reachable = client.health_check()
+        if reachable:
+            console.print(f"[green]✓[/green] LM Studio reachable at {cfg.base_url}")
+        else:
+            console.print(
+                f"[yellow]⚠ Could not reach {cfg.base_url}/models — "
+                "is the LM Studio server started?[/yellow]"
+            )
+
+
+@app.command()
+def chat(
+    path: str = typer.Argument(..., help="Path to the repository to chat about."),
+    resume: Optional[str] = typer.Option(
+        None, "--resume", "-r",
+        help="Resume a previous session by ID (e.g. session_20260627_143000).",
+    ),
+) -> None:
+    """Start a persistent multi-turn chat session with the model about this repo."""
+    root = _resolve_root(path)
+    ensure_default_config(root)
+    config = _load_config_or_exit(root)
+    sessions_dir = workspace_dir(root) / "sessions"
+
+    try:
+        backend = get_backend(config)
+    except (ConfigError, ImportError) as exc:
+        err_console.print(Panel.fit(str(exc), title="[red]Backend error[/red]", border_style="red"))
+        raise typer.Exit(code=1)
+
+    # Load or create session
+    if resume:
+        # Accept both "session_TIMESTAMP" and bare "TIMESTAMP" forms
+        for candidate_name in (resume, f"session_{resume}"):
+            candidate = sessions_dir / f"{candidate_name}.json"
+            if candidate.exists():
+                try:
+                    session = Session.load(candidate)
+                    console.print(
+                        f"[dim]Resumed session [bold]{session.session_id}[/bold] "
+                        f"({session.turn_count} prior turns)[/dim]"
+                    )
+                    break
+                except ValueError as exc:
+                    err_console.print(f"[red]Cannot load session:[/red] {exc}")
+                    raise typer.Exit(code=2)
+        else:
+            err_console.print(f"[red]Session not found:[/red] {resume}")
+            raise typer.Exit(code=2)
+    else:
+        # Build repo context for this session
+        with console.status("[cyan]Scanning repository for chat context...[/cyan]"):
+            index_result = _do_index(root, quiet=True)
+        packet = ctx.build_context(
+            index_result,
+            "general repository overview architecture entry points",
+            max_context_tokens=min(config.max_context_tokens, 8000),
+        )
+        _print_context_summary(packet)
+
+        system_content = prompts.CHAT_SYSTEM + "\n\n# Repository Context\n\n" + packet.body
+        session = Session.new(root, system=system_content)
+        console.print(f"[dim]New session: [bold]{session.session_id}[/bold][/dim]")
+
+    model_label = config.claude_model if config.backend == "claude" else config.model
+    agentic_label = " [agentic]" if config.agentic else ""
+    console.print(
+        f"\n[bold]local-ai chat[/bold]  "
+        f"[dim]model={model_label}{agentic_label}[/dim]  "
+        f"[dim]Type 'exit' or Ctrl-C to quit.[/dim]\n"
+    )
+
+    while True:
+        try:
+            user_input = console.input("[bold]You:[/bold] ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]Session saved.[/dim]")
+            session.save(sessions_dir)
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() in ("exit", "quit", "/exit", "/quit", "/q"):
+            console.print("[dim]Session saved.[/dim]")
+            session.save(sessions_dir)
+            break
+
+        session.messages.append({"role": "user", "content": user_input})
+
+        console.print()
+        console.print("[bold cyan]Assistant:[/bold cyan] ", end="")
+
+        try:
+            if config.agentic:
+                # Agentic loop: model can call tools to look up additional context
+                from .agent import run_agent
+
+                def _on_tool(name: str, inp: dict) -> None:
+                    console.print()
+                    args_preview = ", ".join(f"{k}={v!r}" for k, v in list(inp.items())[:2])
+                    console.print(f"  [dim][tool: {name}({args_preview})][/dim]")
+
+                resp = run_agent(
+                    backend,
+                    session.messages,
+                    repo_root=root,
+                    max_iterations=config.max_agent_iterations,
+                    on_tool_call=_on_tool,
+                )
+                console.print(resp.content)
+                session.messages.append({"role": "assistant", "content": resp.content})
+            else:
+                # Streaming chat (no tool use)
+                chunks: list[str] = []
+                for chunk in backend.stream(session.messages):
+                    console.print(chunk, end="", highlight=False)
+                    sys.stdout.flush()
+                    chunks.append(chunk)
+                console.print()
+                response_text = "".join(chunks)
+                session.messages.append({"role": "assistant", "content": response_text})
+
+        except (ModelError, ConfigError) as exc:
+            console.print()
+            err_console.print(f"[red]Model error:[/red] {exc}")
+            if hasattr(exc, "hint") and exc.hint:
+                err_console.print(f"[yellow]Hint:[/yellow] {exc.hint}")
+            # Pop the failed user message so it can be retried
+            if session.messages and session.messages[-1]["role"] == "user":
+                session.messages.pop()
+            continue
+        except KeyboardInterrupt:
+            console.print("\n[dim](interrupted)[/dim]")
+            if session.messages and session.messages[-1]["role"] == "user":
+                session.messages.pop()
+            console.print("[dim]Session saved.[/dim]")
+            session.save(sessions_dir)
+            break
+
+        console.print()
+        session.save(sessions_dir)
+
+
+# --------------------------------------------------------------------------- private
 
 
 def _build_run_report(result: CommandResult) -> str:
