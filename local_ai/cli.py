@@ -288,9 +288,10 @@ def review(path: str = typer.Option(".", "-C", "--dir", help="Repo directory (de
 @app.command()
 def ask(
     path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current)."),
-    question: str = typer.Argument(..., help="Your question about the repo."),
+    question: list[str] = typer.Argument(..., help="Your question about the repo."),
 ) -> None:
     """Answer a question about the repo, selecting relevant files automatically."""
+    question = " ".join(question)
     root = _resolve_root(path)
     ensure_default_config(root)
     config = _load_config_or_exit(root)
@@ -312,9 +313,10 @@ def ask(
 @app.command()
 def plan(
     path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current)."),
-    task: str = typer.Argument(..., help="The task to plan."),
+    task: list[str] = typer.Argument(..., help="The task to plan."),
 ) -> None:
     """Produce an implementation plan (no edits)."""
+    task = " ".join(task)
     root = _resolve_root(path)
     ensure_default_config(root)
     config = _load_config_or_exit(root)
@@ -345,9 +347,10 @@ def plan(
 @app.command()
 def patch(
     path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current)."),
-    task: str = typer.Argument(..., help="The change to propose as a diff."),
+    task: list[str] = typer.Argument(..., help="The change to propose as a diff."),
 ) -> None:
     """Propose a unified diff for a task (does NOT apply it)."""
+    task = " ".join(task)
     root = _resolve_root(path)
     ensure_default_config(root)
     config = _load_config_or_exit(root)
@@ -494,10 +497,11 @@ def diff(path: str = typer.Option(".", "-C", "--dir", help="Repo directory (defa
 @app.command()
 def run(
     path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current)."),
-    command: str = typer.Argument(..., help="Shell command to run."),
+    command: list[str] = typer.Argument(..., help="Shell command to run."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip dangerous-command confirmation."),
 ) -> None:
     """Run a shell command; on failure, ask the model to diagnose it."""
+    command = " ".join(command)
     root = _resolve_root(path)
     ensure_default_config(root)
     config = _load_config_or_exit(root)
