@@ -1,11 +1,6 @@
 # local-ai workspace artifacts
-.local-ai/reports/
-.local-ai/plans/
-.local-ai/patches/
-.local-ai/runs/
-.local-ai/repo_map.md
-.local-ai/repo_index.json
-.local-ai/memory.json
+# Commit .local-ai/config.toml manually if you want shared per-repo defaults.
+.local-ai/
 
 # Python
 .venv/
