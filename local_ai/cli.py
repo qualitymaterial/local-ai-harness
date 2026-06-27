@@ -218,7 +218,7 @@ def _print_context_summary(packet: ctx.ContextPacket) -> None:
 
 
 @app.command()
-def index(path: str = typer.Argument(..., help="Path to the repository to scan.")) -> None:
+def index(path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current).")) -> None:
     """Scan a repo and write .local-ai/repo_map.md + repo_index.json."""
     root = _resolve_root(path)
     ensure_default_config(root)
@@ -243,7 +243,7 @@ def index(path: str = typer.Argument(..., help="Path to the repository to scan."
 
 
 @app.command()
-def review(path: str = typer.Argument(..., help="Path to the repository to review.")) -> None:
+def review(path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current).")) -> None:
     """Generate a full repository review report."""
     root = _resolve_root(path)
     ensure_default_config(root)
@@ -287,7 +287,7 @@ def review(path: str = typer.Argument(..., help="Path to the repository to revie
 
 @app.command()
 def ask(
-    path: str = typer.Argument(..., help="Path to the repository."),
+    path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current)."),
     question: str = typer.Argument(..., help="Your question about the repo."),
 ) -> None:
     """Answer a question about the repo, selecting relevant files automatically."""
@@ -311,7 +311,7 @@ def ask(
 
 @app.command()
 def plan(
-    path: str = typer.Argument(..., help="Path to the repository."),
+    path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current)."),
     task: str = typer.Argument(..., help="The task to plan."),
 ) -> None:
     """Produce an implementation plan (no edits)."""
@@ -344,7 +344,7 @@ def plan(
 
 @app.command()
 def patch(
-    path: str = typer.Argument(..., help="Path to the repository."),
+    path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current)."),
     task: str = typer.Argument(..., help="The change to propose as a diff."),
 ) -> None:
     """Propose a unified diff for a task (does NOT apply it)."""
@@ -397,7 +397,7 @@ def patch(
 
 @app.command()
 def apply(
-    path: str = typer.Argument(..., help="Path to the repository."),
+    path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current)."),
     patch_file: str = typer.Argument(..., help="Path to the .diff file to apply."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
 ) -> None:
@@ -448,7 +448,7 @@ def apply(
 
 
 @app.command()
-def diff(path: str = typer.Argument(..., help="Path to the git repository.")) -> None:
+def diff(path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current).")) -> None:
     """Review the current git diff with the model."""
     root = _resolve_root(path)
     ensure_default_config(root)
@@ -493,7 +493,7 @@ def diff(path: str = typer.Argument(..., help="Path to the git repository.")) ->
 
 @app.command()
 def run(
-    path: str = typer.Argument(..., help="Path to run the command from."),
+    path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current)."),
     command: str = typer.Argument(..., help="Shell command to run."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip dangerous-command confirmation."),
 ) -> None:
@@ -600,7 +600,7 @@ def config(path: str = typer.Argument(".", help="Path to the repository.")) -> N
 
 @app.command()
 def chat(
-    path: str = typer.Argument(..., help="Path to the repository to chat about."),
+    path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current)."),
     resume: Optional[str] = typer.Option(
         None, "--resume", "-r",
         help="Resume a previous session by ID (e.g. session_20260627_143000).",
