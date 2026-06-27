@@ -96,6 +96,8 @@ command in a repo. You can also create it manually:
 
 ```toml
 # .local-ai/config.toml
+
+# LM Studio backend (default)
 model = "deepseek-coder-v2-lite-instruct"
 base_url = "http://localhost:1234/v1"
 api_key = "lm-studio"
@@ -103,17 +105,70 @@ max_context_tokens = 12000
 temperature = 0.2
 top_p = 0.9
 request_timeout = 600
+
+# Backend selection
+backend = "lmstudio"          # "lmstudio" | "claude"
+claude_model = "claude-opus-4-8"
+claude_api_key = ""           # prefer ANTHROPIC_API_KEY env var
+
+# Feature flags
+stream = false                # token-by-token streaming output
+agentic = false               # multi-step tool-use loop
+max_agent_iterations = 5
 ```
 
 | Key | Default | Description |
 |---|---|---|
 | `model` | `deepseek-coder-v2-lite-instruct` | Model identifier (must match LM Studio) |
 | `base_url` | `http://localhost:1234/v1` | LM Studio server URL |
-| `api_key` | `lm-studio` | Dummy key (LM Studio ignores it, but the field is required) |
-| `max_context_tokens` | `12000` | Token budget for the model context (prompt side). Set this to ≤ your model's context window. |
+| `api_key` | `lm-studio` | Dummy key (LM Studio ignores it) |
+| `max_context_tokens` | `12000` | Token budget for the model context (prompt side) |
 | `temperature` | `0.2` | Sampling temperature. Lower = more deterministic. |
 | `top_p` | `0.9` | Nucleus sampling. |
-| `request_timeout` | `600` | Seconds before giving up on a model response. Local models can be slow. |
+| `request_timeout` | `600` | Seconds before giving up on a model response |
+| `backend` | `lmstudio` | Active backend: `lmstudio` or `claude` |
+| `claude_model` | `claude-opus-4-8` | Claude model ID when `backend = "claude"` |
+| `claude_api_key` | `""` | Anthropic API key — prefer `ANTHROPIC_API_KEY` env var |
+| `stream` | `false` | Stream response tokens to terminal as they arrive |
+| `agentic` | `false` | Enable multi-step tool-use loop for `ask` and `chat` |
+| `max_agent_iterations` | `5` | Max tool-call rounds in the agentic loop |
+
+### Using the Claude backend
+
+Set `backend = "claude"` (or `LOCAL_AI_BACKEND=claude`) and provide your Anthropic API key
+in order of preference:
+
+1. **`ANTHROPIC_API_KEY` environment variable** — standard and recommended:
+   ```bash
+   export ANTHROPIC_API_KEY=sk-ant-...
+   ```
+2. **`~/.claude/.env`** — if the file contains `ANTHROPIC_API_KEY=sk-ant-...`, `local-ai` reads it automatically.
+3. **`claude_api_key` in `.local-ai/config.toml`** — least preferred; do not commit repos with your key in them.
+
+```bash
+LOCAL_AI_BACKEND=claude local-ai ask . "How does authentication work?"
+LOCAL_AI_BACKEND=claude LOCAL_AI_STREAM=1 local-ai review .
+LOCAL_AI_BACKEND=claude LOCAL_AI_AGENTIC=1 local-ai chat .
+```
+
+### Streaming output
+
+Set `stream = true` in config or `LOCAL_AI_STREAM=1` to print tokens as they arrive instead
+of waiting for a spinner. The `chat` command always streams.
+
+### Agentic mode
+
+Set `agentic = true` or `LOCAL_AI_AGENTIC=1` to give the model access to three tools:
+
+| Tool | What it does |
+|---|---|
+| `read_file` | Read the contents of any file in the repo |
+| `search_code` | grep across the repo for a pattern |
+| `list_directory` | List entries in a directory |
+
+The model can call these tools mid-reasoning to fetch context it doesn't have, then
+continue. This is especially useful for `chat` sessions where the model can self-direct
+its own context gathering.
 
 ### Environment variable overrides
 
@@ -123,6 +178,9 @@ All keys can be overridden per-command without editing the file:
 LOCAL_AI_MODEL="qwen2.5-coder-7b-instruct"  local-ai ask . "…"
 LOCAL_AI_BASE_URL="http://192.168.1.10:1234/v1"  local-ai review .
 LOCAL_AI_MAX_CONTEXT_TOKENS=4096  local-ai ask . "…"
+LOCAL_AI_BACKEND=claude  local-ai chat .
+LOCAL_AI_STREAM=1  local-ai review .
+LOCAL_AI_AGENTIC=1  local-ai chat .
 ```
 
 | Variable | Config key |
@@ -131,6 +189,9 @@ LOCAL_AI_MAX_CONTEXT_TOKENS=4096  local-ai ask . "…"
 | `LOCAL_AI_MODEL` | `model` |
 | `LOCAL_AI_API_KEY` | `api_key` |
 | `LOCAL_AI_MAX_CONTEXT_TOKENS` | `max_context_tokens` |
+| `LOCAL_AI_BACKEND` | `backend` |
+| `LOCAL_AI_STREAM` | `stream` |
+| `LOCAL_AI_AGENTIC` | `agentic` |
 
 ### Tuning `max_context_tokens`
 
@@ -364,9 +425,37 @@ local-ai config [PATH]
 ```
 
 Shows the effective configuration for the repo (file + env overrides merged), masks the
-API key, and probes `GET /models` to confirm LM Studio is reachable.
+API key, and probes the active backend for reachability:
+
+- **LM Studio backend** — `GET /models` to confirm the server is running.
+- **Claude backend** — checks that an API key is present.
 
 Creates a default `config.toml` if one doesn't exist yet.
+
+---
+
+### chat
+
+```bash
+local-ai chat PATH [--resume SESSION_ID]
+```
+
+Start a persistent multi-turn conversation with the model about this repository. An
+initial repo scan is performed to build context for the session, then you enter a
+REPL where each exchange is sent with the full conversation history.
+
+Sessions are saved to `.local-ai/sessions/session_TIMESTAMP.json` after each turn and
+can be resumed:
+
+```bash
+local-ai chat .                              # start a new session
+local-ai chat . --resume session_20260627_143000   # resume a previous session
+```
+
+Type `exit` or press Ctrl-C to end the session (it is always saved first).
+
+**With `agentic = true`:** the model can call `read_file`, `search_code`, and
+`list_directory` between turns to fetch additional context from the repo.
 
 ---
 
@@ -476,30 +565,50 @@ The ranker may have scored them below the budget cutoff. Options:
 
 ```
 local_ai/
-  cli.py             Typer app — one function per command, wires everything together
-  config.py          TOML config loader, env overrides, Config dataclass
-  scanner.py         Repo walk (ignore-aware), language detection, structure extraction,
-                     framework detection, file tree renderer
-  gitignore_utils.py Hard-coded ignore lists + pathspec .gitignore loader
-  file_ranker.py     Relevance scoring: path/symbol/folder/concept heuristics
-  context_builder.py Repo map builder + token-budgeted context packet assembler
-  model_client.py    httpx-based OpenAI-compatible client, typed error hierarchy
-  prompts.py         System prompts per mode + message assembler
-  patcher.py         Diff extraction from model output, stats, git apply wrapper
-  command_runner.py  Shell command runner + destructive pattern guard
-  memory.py          Per-repo audit log (.local-ai/memory.json)
-  report_writer.py   Timestamped artifact writers for each output type
-  types.py           Shared dataclasses (FileEntry, RepoIndex, ContextPacket, …)
+  cli.py               Typer app — one function per command, wires everything together
+  config.py            TOML config loader, env overrides, Config dataclass
+  backends/
+    __init__.py        get_backend(config) factory
+    base.py            Abstract BaseBackend (stream, complete, append_tool_messages)
+    lmstudio.py        LM Studio / OpenAI-compatible backend — SSE streaming via httpx
+    claude.py          Anthropic Claude backend — official SDK, adaptive thinking
+  tools.py             Tool definitions (read_file, search_code, list_directory) + executor
+  agent.py             Agentic loop: call → execute tools → loop until done
+  session.py           Session dataclass + JSON save/load for chat history
+  scanner.py           Repo walk (ignore-aware), language detection, structure extraction,
+                       framework detection, file tree renderer
+  gitignore_utils.py   Hard-coded ignore lists + pathspec .gitignore loader
+  file_ranker.py       Relevance scoring: path/symbol/folder/concept heuristics
+  context_builder.py   Repo map builder + token-budgeted context packet assembler
+  model_client.py      httpx LM Studio client + typed error hierarchy (kept for non-streaming)
+  prompts.py           System prompts per mode + message assembler
+  patcher.py           Diff extraction from model output, stats, git apply wrapper
+  command_runner.py    Shell command runner + destructive pattern guard
+  memory.py            Per-repo audit log (.local-ai/memory.json)
+  report_writer.py     Timestamped artifact writers for each output type
+  types.py             Shared dataclasses (FileEntry, RepoIndex, ContextPacket, …)
 ```
 
 ### Data flow for `local-ai ask . "question"`
 
 ```
 user query
-  └─► scanner.scan_repo()          walk repo, extract signals
-        └─► file_ranker.rank_files()   score files against query
-              └─► context_builder.build_context()   fill token budget
-                    └─► model_client.ModelClient.chat()   POST /chat/completions
-                          └─► prompts.build_messages()    system + context + query
+  └─► scanner.scan_repo()           walk repo, extract signals
+        └─► file_ranker.rank_files()    score files against query
+              └─► context_builder.build_context()    fill token budget
+                    └─► get_backend(config)           pick LM Studio or Claude
+                          └─► backend.stream() | complete()
                                 └─► rich console output + memory.record()
+```
+
+### Data flow for `local-ai chat .` (agentic mode)
+
+```
+user message
+  └─► agent.run_agent()
+        └─► backend.complete(messages, tools=TOOL_DEFINITIONS)
+              ├─► if tool_calls: execute_tool(name, input, repo_root)
+              │         └─► backend.append_tool_messages(...)   ← native format per backend
+              │               └─► loop (up to max_agent_iterations)
+              └─► final text response → session.save()
 ```

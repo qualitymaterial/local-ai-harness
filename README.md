@@ -1,23 +1,33 @@
 # local-ai
 
-A **local-first coding assistant CLI** that points your repo at a model running in
-[LM Studio](https://lmstudio.ai) (or any OpenAI-compatible local server) and produces
-**reviews, answers, plans, patches, and run diagnostics** — without uploading your code
-to any cloud API.
+A coding assistant CLI that connects a repo to either a **local LM Studio model** or
+**Claude** (Anthropic API), and produces reviews, answers, plans, patches, run
+diagnostics, and multi-turn chat — with full context built automatically from the repo.
 
 ```
-local-ai index .
+local-ai index  .
 local-ai review .
-local-ai ask   . "Where is the homepage component?"
-local-ai plan  . "Refactor this app into cleaner components"
-local-ai patch . "Fix the mobile layout issue"
-local-ai apply . .local-ai/patches/patch_20260627_143015.diff
-local-ai diff  .
-local-ai run   . "npm run build"
+local-ai ask    . "Where is the homepage component?"
+local-ai plan   . "Refactor this app into cleaner components"
+local-ai patch  . "Fix the mobile layout issue"
+local-ai apply  . .local-ai/patches/patch_20260627_143015.diff
+local-ai diff   .
+local-ai run    . "npm run build"
+local-ai chat   .                              # persistent multi-turn chat
+local-ai chat   . --resume session_20260627_143000
 ```
 
-It is fully local: **no OpenAI, Anthropic, or cloud APIs**. The only network call is to
-your LM Studio server (default `http://localhost:1234/v1`).
+**Two backends:**
+
+| Backend | When to use | Config |
+|---|---|---|
+| LM Studio (default) | Fully local, no API costs | `backend = "lmstudio"` |
+| Claude | Stronger reasoning, cloud API | `backend = "claude"` |
+
+**Key features:**
+- **Streaming output** — token-by-token printing (`stream = true` or `LOCAL_AI_STREAM=1`)
+- **Agentic loop** — model calls `read_file` / `search_code` / `list_directory` mid-reasoning (`agentic = true`)
+- **Persistent chat** — multi-turn sessions saved to `.local-ai/sessions/`, resumable
 
 ---
 
@@ -120,7 +130,8 @@ LOCAL_AI_MODEL="qwen2.5-coder-7b-instruct" local-ai ask . "What does this projec
 | `local-ai apply PATH FILE` | Apply a patch via `git apply`, with confirmation |
 | `local-ai diff PATH` | Review the current `git diff HEAD` |
 | `local-ai run PATH "CMD"` | Run a command; on failure, diagnose it → `.local-ai/runs/run_*.md` |
-| `local-ai config PATH` | Show effective config + server reachability |
+| `local-ai config PATH` | Show effective config + backend reachability |
+| `local-ai chat PATH` | Persistent multi-turn chat session about this repo |
 
 ### Safety guarantees
 
