@@ -25,7 +25,9 @@ independent of it.
   appended on a new line; no args → `$ARGUMENTS` becomes "".
 - **Built-ins always win** — a command file cannot shadow `/claude`, `/local`,
   `/qwen`, `/opus`, `/cost`, `/spend`, `/help`, `exit`/`quit`.
-- **Chat REPL only** in v1 (no separate CLI subcommand).
+- **Two entry points:** the chat REPL (`/name args`) **and** one-shot from the
+  terminal as `ai /name args` (e.g. `ai /review the auth module`). Both share the
+  same command files and resolution.
 - Commands are read fresh on each invocation (edit a file → effect is immediate).
 
 ## Architecture
@@ -109,6 +111,39 @@ treated exactly like a typed message (RAG context, cost meter, etc. all apply).
 `/help` is extended: after listing built-ins, call `list_commands(root)` and
 print each custom command as `  /<name>  — <description>  (<scope>)`.
 
+### CLI one-shot invocation (`ai /name args`)
+
+A new Typer command runs a command from the terminal without entering chat:
+
+```python
+@app.command()
+def cmd(
+    name: str = typer.Argument(..., help="Command name (without the slash)."),
+    args: list[str] = typer.Argument(None, help="Arguments ($ARGUMENTS)."),
+    path: str = typer.Option(".", "-C", "--dir"),
+) -> None:
+    ...
+```
+
+`cmd` resolves the command via `find_command(name, root)` (project then global),
+errors with exit code 2 if not found, errors if the body is empty, otherwise
+`expand_command(body, " ".join(args or []))` and runs the expanded prompt
+through the **same path as `ask`** (RAG retrieval + context + `_call_model`).
+
+To avoid duplicating `ask`'s body, extract its core into a shared helper
+`_answer_prompt(root: Path, config: Config, prompt: str) -> None` (does
+`_get_index` → `_semantic_files` → `ctx.build_context` → `_print_context_summary`
+→ `_call_model(config, prompts.ASK_SYSTEM, packet.body, prompt, repo_root=root)`).
+Both `ask` and `cmd` call `_answer_prompt`. This is a small, in-scope refactor of
+the existing `ask` command.
+
+**Sugar in `main()`:** the existing `main()` rewrites `sys.argv` (bare `ai` →
+`chat`; unknown leading word → `ask`). Add one rule **first**: if the first
+non-flag token starts with `/`, rewrite `["/review", "x", "y"]` →
+`["cmd", "review", "x", "y"]` (strip the slash, insert `cmd`). Add `"cmd"` to the
+`_COMMANDS` set so it's recognized. `ai /name` invokes custom commands only
+(chat built-ins like `/claude` are not CLI commands; an unknown name errors).
+
 ## Edge cases
 
 - Unknown `/foo` → warning, nothing sent to the model.
@@ -150,17 +185,27 @@ fully controllable. (Global-dir resolution uses `Path.home()`; tests monkeypatch
    - `/nope` with no file → `("unknown", "nope")`;
    - empty command file → `("empty", name)`.
 
+**CLI path:** `cmd` reuses the already-tested `find_command` / `load_command` /
+`expand_command` plus the shared `_answer_prompt` helper, so it needs no new pure
+tests. The `main()` slash rewrite is argv manipulation covered by the live check
+below; keep the rewrite logic to the single documented rule so it stays trivially
+correct.
+
 ### Post-implementation live check (manual)
 
 Create `~/.local-ai/commands/British.md` with body
-`Answer this in British spelling: $ARGUMENTS`, run `ai chat`, type
-`/British what is colour optimization`, confirm it expands and the answer
-respects the instruction. Also confirm `/help` lists it and `/bogus` is rejected.
+`Answer this in British spelling: $ARGUMENTS`, then:
+- **Chat:** run `ai chat`, type `/British what is colour optimization`, confirm
+  it expands and the answer respects the instruction; confirm `/help` lists it
+  and `/bogus` is rejected.
+- **CLI:** run `ai /British "what is colour optimization"` from the terminal and
+  confirm the same expansion/behavior one-shot; confirm `ai /bogus` errors.
 
 ## Out of scope
 
-- Persistent toggle/mode commands.
-- Positional args (`$1`, `$2`) — only `$ARGUMENTS`.
-- A CLI subcommand form (`ai run-command ...`).
-- Semantic/keyword auto-selection of commands.
-- Namespacing/subdirectories of commands.
+- Persistent toggle/mode commands (you chose one-shot expansion; AGENTS.md
+  already covers always-on instructions).
+- Positional args (`$1`, `$2`) — only `$ARGUMENTS` (YAGNI; easy to add later).
+- Semantic/keyword auto-selection of commands (rejected alternative; reintroduces
+  guessing we're avoiding on the 14B).
+- Namespacing/subdirectories of commands (YAGNI until the folder gets crowded).
