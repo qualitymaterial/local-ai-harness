@@ -392,6 +392,22 @@ def review(path: str = typer.Option(".", "-C", "--dir", help="Repo directory (de
     console.print(f"[green]✓[/green] Full report: [bold]{report_path}[/bold]")
 
 
+def _answer_prompt(root: Path, config: Config, prompt: str) -> str:
+    """Run a prompt through the standard ask pipeline (RAG context + model)."""
+    index_result = _get_index(root)
+    force = _semantic_files(root, config, prompt)
+    packet = ctx.build_context(
+        index_result, prompt,
+        max_context_tokens=config.max_context_tokens,
+        force_include=force,
+    )
+    _print_context_summary(packet)
+    output = _call_model(config, prompts.ASK_SYSTEM, packet.body, prompt, repo_root=root)
+    if not config.stream:
+        console.print(Panel(output, title="Answer", border_style="cyan"))
+    return output
+
+
 @app.command()
 def ask(
     path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current)."),
@@ -402,24 +418,39 @@ def ask(
     root = _resolve_root(path)
     ensure_default_config(root)
     config = _load_config_or_exit(root)
-    index_result = _get_index(root)
-
-    force = _semantic_files(root, config, question)
-    packet = ctx.build_context(
-        index_result, question,
-        max_context_tokens=config.max_context_tokens,
-        force_include=force,
-    )
-    _print_context_summary(packet)
-
-    output = _call_model(config, prompts.ASK_SYSTEM, packet.body, question, repo_root=root)
-
+    _answer_prompt(root, config, question)
     mem = Memory.load(root)
     mem.record("ask", question=question[:200])
     mem.save()
 
-    if not config.stream:
-        console.print(Panel(output, title="Answer", border_style="cyan"))
+
+@app.command()
+def cmd(
+    name: str = typer.Argument(..., help="Command name (without the slash)."),
+    args: Optional[list[str]] = typer.Argument(None, help="Arguments ($ARGUMENTS)."),
+    path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current)."),
+) -> None:
+    """Run a custom slash command from .local-ai/commands/ (project or global)."""
+    from .commands import expand_command, find_command, load_command
+
+    root = _resolve_root(path)
+    ensure_default_config(root)
+    config = _load_config_or_exit(root)
+
+    cmd_path = find_command(name, root)
+    if cmd_path is None:
+        err_console.print(f"[red]Unknown command:[/red] /{name}")
+        raise typer.Exit(code=2)
+    _description, body = load_command(cmd_path)
+    if not body.strip():
+        err_console.print(f"[red]Command '/{name}' is empty.[/red]")
+        raise typer.Exit(code=1)
+
+    prompt = expand_command(body, " ".join(args or []))
+    _answer_prompt(root, config, prompt)
+    mem = Memory.load(root)
+    mem.record("cmd", name=name)
+    mem.save()
 
 
 @app.command()
@@ -978,23 +1009,51 @@ def _build_run_report(result: CommandResult) -> str:
     return "\n".join(parts)
 
 
-def main() -> None:
-    """Entry point — bare `ai "question"` defaults to the ask command."""
-    import sys
-    _COMMANDS = {
-        "index", "review", "ask", "plan", "patch",
-        "apply", "diff", "run", "config", "chat", "embed",
-    }
-    non_flags = [a for a in sys.argv[1:] if not a.startswith("-")]
-    help_requested = bool({"--help", "-h"} & set(sys.argv[1:]))
+def _rewrite_cli_args(args: list[str], known_commands: set[str]) -> list[str]:
+    """Map bare/slash invocations to subcommands. Operates on argv[1:].
+
+    - no positional args → `chat`
+    - first non-flag starts with `/` → `cmd <name> ...` (custom command)
+    - first non-flag is not a known command → `ask ...`
+    - otherwise unchanged
+    """
+    non_flags = [a for a in args if not a.startswith("-")]
+    help_requested = bool({"--help", "-h"} & set(args))
 
     if not non_flags and not help_requested:
-        # Bare `ai` → drop into conversational chat
-        sys.argv.insert(1, "chat")
-    elif non_flags and non_flags[0] not in _COMMANDS:
-        # Words but no known command → treat as a one-shot question
-        idx = next(i for i, a in enumerate(sys.argv[1:], 1) if not a.startswith("-"))
-        sys.argv.insert(idx, "ask")
+        return ["chat", *args]
+    if non_flags and non_flags[0].startswith("/"):
+        # Find the first slash token that is NOT a flag value (i.e., not immediately
+        # preceded by a flag token starting with "-").
+        out = list(args)
+        idx = None
+        for i, a in enumerate(out):
+            if a.startswith("/") and (i == 0 or not out[i - 1].startswith("-")):
+                idx = i
+                break
+        if idx is None:
+            # All slash tokens were flag values; fall through unchanged
+            return args
+        out[idx] = out[idx][1:]  # strip leading slash → command name
+        out.insert(idx, "cmd")
+        return out
+    if non_flags and non_flags[0] not in known_commands:
+        out = list(args)
+        idx = next(i for i, a in enumerate(out) if not a.startswith("-"))
+        out.insert(idx, "ask")
+        return out
+    return args
+
+
+def main() -> None:
+    """Entry point — bare `ai` → chat; `ai /name` → custom command; words → ask."""
+    import sys
+
+    _COMMANDS = {
+        "index", "review", "ask", "plan", "patch",
+        "apply", "diff", "run", "config", "chat", "embed", "cmd",
+    }
+    sys.argv[1:] = _rewrite_cli_args(sys.argv[1:], _COMMANDS)
     app()
 
 
