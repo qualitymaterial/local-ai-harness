@@ -41,6 +41,13 @@ app = typer.Typer(
 console = Console()
 err_console = Console(stderr=True)
 
+# Chat built-in slash command names (without the slash). A command file cannot
+# shadow these — they are handled directly by the chat loop.
+_BUILTIN_SLASH_NAMES = {
+    "claude", "opus", "local", "qwen", "cost", "spend",
+    "help", "h", "?", "exit", "quit", "q",
+}
+
 
 # --------------------------------------------------------------------------- helpers
 
@@ -804,6 +811,15 @@ def chat(
                 "  [bold]/help[/bold]               — show this help\n"
                 "  [bold]exit[/bold]                — quit (session is saved)\n"
             )
+            from .commands import list_commands
+
+            _cmds = list_commands(root)
+            if _cmds:
+                console.print("[dim]Custom commands:[/dim]")
+                for _c in _cmds:
+                    console.print(
+                        f"  [bold]/{_c.name}[/bold]  — {_c.description}  [dim]({_c.scope})[/dim]"
+                    )
             continue
 
         if user_input.lower() in ("/cost", "/spend"):
@@ -835,6 +851,20 @@ def chat(
             kind = "cloud" if config.backend == "claude" else "local"
             console.print(f"[green]✓ Switched to {model_label}[/green] [dim]({kind})[/dim]\n")
             continue
+
+        # Custom slash commands (project/global .local-ai/commands/*.md).
+        if user_input.startswith("/"):
+            from .commands import resolve_slash
+
+            _kind, _payload = resolve_slash(user_input, _BUILTIN_SLASH_NAMES, root)
+            if _kind == "unknown":
+                console.print(f"[yellow]Unknown command: /{_payload} (try /help)[/yellow]\n")
+                continue
+            if _kind == "empty":
+                console.print(f"[yellow]Command '/{_payload}' is empty.[/yellow]\n")
+                continue
+            if _kind == "expand":
+                user_input = _payload  # fall through to normal message handling
 
         # Auto-routing: offer to escalate complex turns to Claude (opt-in via auto_route).
         if config.auto_route and config.backend != "claude":
