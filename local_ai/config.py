@@ -25,11 +25,11 @@ CONFIG_FILENAME = "config.toml"
 
 DEFAULTS: dict[str, object] = {
     # Local backend (LM Studio, OpenAI-compatible endpoint)
-    "model": "qwen3-coder-30b",
+    "model": "qwen/qwen2.5-coder-14b",
     "base_url": "http://localhost:1234/v1",
     "api_key": "lm-studio",
     "embedding_model": "text-embedding-nomic-embed-text-v1.5",  # for semantic codebase search
-    "max_context_tokens": 24000,
+    "max_context_tokens": 12000,
     "temperature": 0.2,
     "top_p": 0.9,
     "request_timeout": 600,
@@ -39,7 +39,7 @@ DEFAULTS: dict[str, object] = {
     "claude_api_key": "",         # prefer ANTHROPIC_API_KEY env var or ~/.claude/.env
     # Feature flags
     "stream": True,               # token-by-token streaming output
-    "agentic": True,              # enable multi-step tool-use loop (reads files itself)
+    "agentic": False,             # multi-step tool-use loop; off by default — unreliable on small local models, and RAG already supplies context. Great on the Claude backend.
     "max_agent_iterations": 6,
     "auto_route": False,          # in chat, offer to escalate complex turns to Claude
 }

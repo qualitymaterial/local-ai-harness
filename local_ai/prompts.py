@@ -157,13 +157,20 @@ Guidelines:
 
 
 def build_messages(system: str, context_body: str, user_request: str) -> list[ChatMessage]:
-    """Assemble the standard 3-part message list: system, context, user request."""
-    context_msg = (
+    """Assemble a [system, user] message list.
+
+    Context and the request go in a SINGLE user message — two consecutive user
+    messages make some local models (e.g. qwen2.5-coder) return an empty
+    completion, so we never emit consecutive same-role messages.
+    """
+    user_msg = (
         "Here is the repository context packet assembled for this request. "
-        "Treat it as the only files you can see:\n\n" + context_body
+        "Treat it as the only files you can see:\n\n"
+        + context_body
+        + "\n\n---\n\n# Request\n\n"
+        + user_request
     )
     return [
         ChatMessage(role="system", content=system),
-        ChatMessage(role="user", content=context_msg),
-        ChatMessage(role="user", content=user_request),
+        ChatMessage(role="user", content=user_msg),
     ]
