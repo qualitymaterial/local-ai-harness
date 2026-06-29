@@ -168,6 +168,14 @@ def _call_model(
     repo_root: Optional[Path] = None,
 ) -> str:
     """Call the model, using streaming / agentic mode based on config."""
+    # Inject per-repo project instructions (AGENTS.md / CLAUDE.md) when we have a repo.
+    if repo_root is not None:
+        from .instructions import augment_system, load_instructions
+
+        _loaded = load_instructions(repo_root)
+        if _loaded:
+            system = augment_system(system, _loaded)
+            console.print(f"[dim][project instructions: {_loaded.source}][/dim]")
     messages = prompts.build_messages(system, context_body, request)
     msgs = [{"role": m.role, "content": m.content} for m in messages]
 
@@ -749,7 +757,14 @@ def chat(
         )
         _print_context_summary(packet)
 
-        system_content = prompts.CHAT_SYSTEM + "\n\n# Repository Context\n\n" + packet.body
+        from .instructions import augment_system, load_instructions
+
+        _base_system = prompts.CHAT_SYSTEM
+        _loaded = load_instructions(root)
+        if _loaded:
+            _base_system = augment_system(_base_system, _loaded)
+            console.print(f"[dim][project instructions: {_loaded.source}][/dim]")
+        system_content = _base_system + "\n\n# Repository Context\n\n" + packet.body
         session = Session.new(root, system=system_content)
         console.print(f"[dim]New session: [bold]{session.session_id}[/bold][/dim]")
 
