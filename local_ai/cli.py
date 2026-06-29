@@ -449,7 +449,7 @@ def cmd(
     prompt = expand_command(body, " ".join(args or []))
     _answer_prompt(root, config, prompt)
     mem = Memory.load(root)
-    mem.record("cmd", name=name)
+    mem.record("cmd", name=name, args=" ".join(args or [])[:200])
     mem.save()
 
 
@@ -896,6 +896,8 @@ def chat(
                 continue
             if _kind == "expand":
                 user_input = _payload  # fall through to normal message handling
+            if _kind == "builtin":
+                continue  # built-ins are handled earlier; never echo a slash to the model
 
         # Auto-routing: offer to escalate complex turns to Claude (opt-in via auto_route).
         if config.auto_route and config.backend != "claude":
