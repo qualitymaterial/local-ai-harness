@@ -201,11 +201,14 @@ Create `~/.local-ai/commands/British.md` with body
 - **CLI:** run `ai /British "what is colour optimization"` from the terminal and
   confirm the same expansion/behavior one-shot; confirm `ai /bogus` errors.
 
-## Out of scope
+## Out of scope (v1) — queued for a follow-up pass
 
-- Persistent toggle/mode commands (you chose one-shot expansion; AGENTS.md
-  already covers always-on instructions).
-- Positional args (`$1`, `$2`) — only `$ARGUMENTS` (YAGNI; easy to add later).
-- Semantic/keyword auto-selection of commands (rejected alternative; reintroduces
-  guessing we're avoiding on the 14B).
-- Namespacing/subdirectories of commands (YAGNI until the folder gets crowded).
+These are intentionally deferred to a second pass after v1 ships:
+
+- Positional args (`$1`, `$2`) in addition to `$ARGUMENTS`.
+- Persistent toggle/mode commands (note: AGENTS.md already covers always-on
+  instructions, so revisit whether this is still wanted).
+- Namespacing/subdirectories of commands (once the folder gets crowded).
+- Semantic/keyword auto-selection of commands (lower priority — reintroduces the
+  guessing we're avoiding on the 14B; only if explicit invocation proves
+  insufficient).
