@@ -24,22 +24,24 @@ CONFIG_FILENAME = "config.toml"
 
 
 DEFAULTS: dict[str, object] = {
-    # LM Studio backend
-    "model": "deepseek-coder-v2-lite-instruct",
+    # Local backend (LM Studio, OpenAI-compatible endpoint)
+    "model": "qwen3-coder-30b",
     "base_url": "http://localhost:1234/v1",
     "api_key": "lm-studio",
-    "max_context_tokens": 3000,
+    "embedding_model": "text-embedding-nomic-embed-text-v1.5",  # for semantic codebase search
+    "max_context_tokens": 24000,
     "temperature": 0.2,
     "top_p": 0.9,
     "request_timeout": 600,
     # Backend selection
-    "backend": "lmstudio",        # "lmstudio" | "claude"
+    "backend": "local",           # "local" (Ollama/LM Studio) | "claude"
     "claude_model": "claude-opus-4-8",
     "claude_api_key": "",         # prefer ANTHROPIC_API_KEY env var or ~/.claude/.env
     # Feature flags
-    "stream": False,              # token-by-token streaming output
-    "agentic": False,             # enable multi-step tool-use loop
-    "max_agent_iterations": 5,
+    "stream": True,               # token-by-token streaming output
+    "agentic": True,              # enable multi-step tool-use loop (reads files itself)
+    "max_agent_iterations": 6,
+    "auto_route": False,          # in chat, offer to escalate complex turns to Claude
 }
 
 
@@ -48,6 +50,7 @@ class Config:
     model: str
     base_url: str
     api_key: str
+    embedding_model: str
     max_context_tokens: int
     temperature: float
     top_p: float
@@ -58,6 +61,7 @@ class Config:
     stream: bool
     agentic: bool
     max_agent_iterations: int
+    auto_route: bool
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "Config":
@@ -66,6 +70,7 @@ class Config:
             model=str(merged["model"]),
             base_url=str(merged["base_url"]).rstrip("/"),
             api_key=str(merged["api_key"]),
+            embedding_model=str(merged["embedding_model"]),
             max_context_tokens=int(merged["max_context_tokens"]),  # type: ignore[arg-type]
             temperature=float(merged["temperature"]),  # type: ignore[arg-type]
             top_p=float(merged["top_p"]),  # type: ignore[arg-type]
@@ -76,6 +81,7 @@ class Config:
             stream=bool(merged["stream"]),
             agentic=bool(merged["agentic"]),
             max_agent_iterations=int(merged["max_agent_iterations"]),  # type: ignore[arg-type]
+            auto_route=bool(merged["auto_route"]),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -124,6 +130,8 @@ def _env_overrides() -> dict[str, object]:
         out["stream"] = v.lower() in ("1", "true", "yes")
     if v := os.environ.get("LOCAL_AI_AGENTIC"):
         out["agentic"] = v.lower() in ("1", "true", "yes")
+    if v := os.environ.get("LOCAL_AI_AUTO_ROUTE"):
+        out["auto_route"] = v.lower() in ("1", "true", "yes")
     return out
 
 

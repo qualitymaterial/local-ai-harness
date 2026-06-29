@@ -24,6 +24,8 @@ from .command_runner import CommandResult, check_dangerous, run_command, tail
 from .config import Config, ConfigError, ensure_default_config, load_config, workspace_dir
 from .memory import Memory
 from .model_client import ModelClient, ModelError
+from .pricing import SessionCost
+from .routing import route_request
 from .session import Session
 from .types import RepoIndex
 
@@ -57,6 +59,58 @@ def _load_config_or_exit(root: Path) -> Config:
     except ConfigError as exc:
         err_console.print(f"[red]Config error:[/red] {exc}")
         raise typer.Exit(code=2)
+
+
+# Backend-switch slash commands available inside `chat`.
+# /claude and /opus escalate to the cloud Claude backend; /local and /qwen
+# return to the local model. The switch keeps the full conversation context.
+_BACKEND_COMMANDS = {
+    "/claude": "claude",
+    "/opus": "claude",
+    "/local": "local",
+    "/qwen": "local",
+}
+
+
+def parse_backend_command(text: str) -> Optional[str]:
+    """Return the target backend for a backend-switch slash command, else None.
+
+    Matches are exact, case-insensitive, and ignore surrounding whitespace.
+    A mention inside a longer sentence (e.g. "tell me about /claude") is not a command.
+    """
+    return _BACKEND_COMMANDS.get(text.strip().lower())
+
+
+def _semantic_files(root: Path, config: Config, query: str, *, top_k: int = 8) -> Optional[list[str]]:
+    """Use the embedding index (if built) to find the files most relevant to a query.
+
+    Returns an ordered, de-duplicated list of relative paths, or None if no index
+    exists or the embeddings endpoint is unavailable (caller then falls back to
+    keyword ranking).
+    """
+    db = workspace_dir(root) / "embeddings.db"
+    if not db.exists():
+        return None
+    try:
+        from .embeddings import EmbeddingClient, EmbeddingIndex
+
+        idx = EmbeddingIndex(db)
+        if idx.count() == 0:
+            return None
+        hits = idx.search(query, EmbeddingClient(config).embed, top_k=top_k)
+    except (ModelError, ConfigError) as exc:
+        console.print(f"[yellow]Semantic search unavailable ({exc}); using keyword ranking.[/yellow]")
+        return None
+
+    seen: set[str] = set()
+    files: list[str] = []
+    for h in hits:
+        if h.rel_path not in seen:
+            seen.add(h.rel_path)
+            files.append(h.rel_path)
+    if files:
+        console.print(f"[dim]semantic match: {', '.join(files[:8])}[/dim]")
+    return files or None
 
 
 def _index_to_json(index: RepoIndex) -> str:
@@ -243,6 +297,44 @@ def index(path: str = typer.Option(".", "-C", "--dir", help="Repo directory (def
 
 
 @app.command()
+def embed(path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current).")) -> None:
+    """Build the semantic embedding index (.local-ai/embeddings.db) for this repo."""
+    from .embeddings import EmbeddingClient, EmbeddingIndex, chunk_repo
+
+    root = _resolve_root(path)
+    ensure_default_config(root)
+    config = _load_config_or_exit(root)
+    index_result = _get_index(root)
+
+    rels = [f.rel_path for f in index_result.files if not f.is_binary]
+    with console.status("[cyan]Chunking repository...[/cyan]"):
+        chunks = chunk_repo(root, rels)
+    if not chunks:
+        console.print("[yellow]No text files to index.[/yellow]")
+        raise typer.Exit(code=0)
+
+    client = EmbeddingClient(config)
+    db = workspace_dir(root) / "embeddings.db"
+    try:
+        with console.status(f"[cyan]Embedding {len(chunks)} chunks via {client.model}...[/cyan]"):
+            n = EmbeddingIndex(db).build(chunks, client.embed)
+    except (ModelError, ConfigError) as exc:
+        err_console.print(Panel.fit(str(exc), title="[red]Embedding error[/red]", border_style="red"))
+        if getattr(exc, "hint", None):
+            err_console.print(f"[yellow]Hint:[/yellow] {exc.hint}")
+        raise typer.Exit(code=1)
+
+    mem = Memory.load(root)
+    mem.record("embed", chunks=n, files=len(rels))
+    mem.save()
+    console.print(
+        f"[green]✓[/green] Indexed [bold]{n}[/bold] chunks from {len(rels)} files "
+        f"→ [bold].local-ai/embeddings.db[/bold]"
+    )
+    console.print("[dim]`ai ask` will now use semantic retrieval automatically.[/dim]")
+
+
+@app.command()
 def review(path: str = typer.Option(".", "-C", "--dir", help="Repo directory (default: current).")) -> None:
     """Generate a full repository review report."""
     root = _resolve_root(path)
@@ -297,7 +389,12 @@ def ask(
     config = _load_config_or_exit(root)
     index_result = _get_index(root)
 
-    packet = ctx.build_context(index_result, question, max_context_tokens=config.max_context_tokens)
+    force = _semantic_files(root, config, question)
+    packet = ctx.build_context(
+        index_result, question,
+        max_context_tokens=config.max_context_tokens,
+        force_include=force,
+    )
     _print_context_summary(packet)
 
     output = _call_model(config, prompts.ASK_SYSTEM, packet.body, question, repo_root=root)
@@ -660,9 +757,11 @@ def chat(
     agentic_label = " [agentic]" if config.agentic else ""
     console.print(
         f"\n[bold]local-ai chat[/bold]  "
-        f"[dim]model={model_label}{agentic_label}[/dim]  "
-        f"[dim]Type 'exit' or Ctrl-C to quit.[/dim]\n"
+        f"[dim]model={model_label}{agentic_label}[/dim]\n"
+        f"[dim]/claude → escalate to Claude · /local → back to local · /help · 'exit' to quit[/dim]\n"
     )
+
+    cost = SessionCost()  # tracks Claude spend across this session
 
     while True:
         try:
@@ -676,8 +775,73 @@ def chat(
             continue
         if user_input.lower() in ("exit", "quit", "/exit", "/quit", "/q"):
             console.print("[dim]Session saved.[/dim]")
+            if cost.total_usd > 0:
+                console.print(f"[dim]Claude spend this session: ${cost.total_usd:.4f}[/dim]")
             session.save(sessions_dir)
             break
+
+        if user_input.lower() in ("/help", "/?", "/h"):
+            console.print(
+                "[dim]Commands:[/dim]\n"
+                "  [bold]/claude[/bold] or [bold]/opus[/bold]  — escalate this session to Claude (cloud)\n"
+                "  [bold]/local[/bold] or [bold]/qwen[/bold]   — switch back to the local model\n"
+                "  [bold]/cost[/bold]               — show Claude spend so far this session\n"
+                "  [bold]/help[/bold]               — show this help\n"
+                "  [bold]exit[/bold]                — quit (session is saved)\n"
+            )
+            continue
+
+        if user_input.lower() in ("/cost", "/spend"):
+            console.print(
+                f"[dim]Claude spend this session: ${cost.total_usd:.4f} "
+                f"({cost.prompt_tokens} in + {cost.completion_tokens} out tokens)[/dim]\n"
+            )
+            continue
+
+        # Backend switch: escalate to Claude or drop back to local, keeping context.
+        target_backend = parse_backend_command(user_input)
+        if target_backend is not None:
+            current_label = config.claude_model if config.backend == "claude" else config.model
+            if target_backend == config.backend:
+                console.print(f"[dim]Already using {current_label}.[/dim]\n")
+                continue
+            previous_backend = config.backend
+            config.backend = target_backend
+            try:
+                backend = get_backend(config)
+            except (ConfigError, ImportError) as exc:
+                config.backend = previous_backend  # revert — switch failed
+                err_console.print(f"[red]Could not switch backend:[/red] {exc}")
+                if getattr(exc, "hint", None):
+                    err_console.print(f"[yellow]Hint:[/yellow] {exc.hint}")
+                console.print(f"[dim]Staying on {current_label}.[/dim]\n")
+                continue
+            model_label = config.claude_model if config.backend == "claude" else config.model
+            kind = "cloud" if config.backend == "claude" else "local"
+            console.print(f"[green]✓ Switched to {model_label}[/green] [dim]({kind})[/dim]\n")
+            continue
+
+        # Auto-routing: offer to escalate complex turns to Claude (opt-in via auto_route).
+        if config.auto_route and config.backend != "claude":
+            decision = route_request(user_input, current_backend=config.backend)
+            if decision.escalate:
+                console.print(f"[yellow]⤴ This {decision.reason}.[/yellow]")
+                if typer.confirm("Escalate this to Claude?", default=False):
+                    previous_backend = config.backend
+                    config.backend = "claude"
+                    try:
+                        backend = get_backend(config)
+                        model_label = config.claude_model
+                        console.print(
+                            f"[green]✓ Escalated to {model_label}[/green] "
+                            f"[dim](cloud — /local to return)[/dim]\n"
+                        )
+                    except (ConfigError, ImportError) as exc:
+                        config.backend = previous_backend  # revert — escalation failed
+                        err_console.print(f"[red]Could not escalate:[/red] {exc}")
+                        if getattr(exc, "hint", None):
+                            err_console.print(f"[yellow]Hint:[/yellow] {exc.hint}")
+                        console.print("[dim]Staying local.[/dim]\n")
 
         session.messages.append({"role": "user", "content": user_input})
 
@@ -703,6 +867,12 @@ def chat(
                 )
                 console.print(resp.content)
                 session.messages.append({"role": "assistant", "content": resp.content})
+                active_model = config.claude_model if config.backend == "claude" else config.model
+                spent = cost.add(active_model, resp.prompt_tokens or 0, resp.completion_tokens or 0)
+                if spent > 0:
+                    console.print(
+                        f"[dim]+${spent:.4f}  ·  session ${cost.total_usd:.4f}[/dim]"
+                    )
             else:
                 # Streaming chat (no tool use)
                 chunks: list[str] = []
@@ -768,7 +938,7 @@ def main() -> None:
     import sys
     _COMMANDS = {
         "index", "review", "ask", "plan", "patch",
-        "apply", "diff", "run", "config", "chat",
+        "apply", "diff", "run", "config", "chat", "embed",
     }
     non_flags = [a for a in sys.argv[1:] if not a.startswith("-")]
     help_requested = bool({"--help", "-h"} & set(sys.argv[1:]))
